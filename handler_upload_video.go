@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"crypto/rand"
 
+
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/google/uuid"
@@ -71,6 +72,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	mediaType, _, err := mime.ParseMediaType(header.Header.Get("Content-Type"))
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Couldn't parse media type", err)
+		return
 	}
 
 	if mediaType != "video/mp4" {
@@ -82,6 +84,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	tmpFile, err := os.CreateTemp("/tmp/", "video")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Couldn't create temp file", err)
+		return
 	}
 	defer os.Remove(tmpFile.Name())
 	defer tmpFile.Close()
@@ -97,28 +100,54 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	_, err = tmpFile.Seek(0, io.SeekStart)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Couldn't reset file's pointer", err)
+		return
 	}
 
 	// create new file name
 	fileName := createNewFileName("mp4")
+	
+	filePath := tmpFile.Name()
+	filePathError := fmt.Sprintf("Couldn't get video aspect ratio from: %s", filePath)
+
+	// get video aspect ratio
+	aspectRatio, err := getVideoAspectRatio(filePath)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, filePathError, err)
+		return
+	}
+
+	// create new video file processed for fast start
+	newFilePath, err := processVideoForFastStart(filePath)
+	processedFile, err := os.Open(newFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Couldn't open processed file", err)
+	}
+	defer os.Remove(newFilePath)
+	defer processedFile.Close()
+
+
+	fileNamePrefix := createVideoPrefix(aspectRatio)
+	fileNameV2 := fmt.Sprintf("%s%s", fileNamePrefix, fileName)
 
 	// add object to s3
 	objectInput := s3.PutObjectInput {
 		Bucket:      &cfg.s3Bucket, // bucket name
-		Key:         &fileName,     // file name
-		Body:        tmpFile,       // file to upload
+		Key:         &fileNameV2,   // file name
+		Body:        processedFile, // file to upload
 		ContentType: &mediaType,    // mime type (media type)
 	}
 
 	_, err = cfg.s3Client.PutObject(r.Context(), &objectInput)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Couldn't add object to s3 bucket", err)
+		return
 	}
 
 	// update video URL
-	newVideoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s",cfg.s3Bucket, cfg.s3Region, fileName)
+	newVideoURL := fmt.Sprintf("%s%s",cfg.s3CfDistribution, fileNameV2)
 	videoData.VideoURL = &newVideoURL
-
+	
+	// update db Videos
 	err = cfg.db.UpdateVideo(videoData)
 		if err != nil {
 			respondWithError(w, http.StatusBadRequest, "Unable to save video metadata", err)
@@ -143,6 +172,16 @@ func createNewFileName(fileExtention string) string {
 	fileName := fmt.Sprintf("%s.%s", encodedNewFileName, fileExtention)
 
 	return fileName
+}
+
+
+func createVideoPrefix(aspectRatio string) string {
+	
+	if aspectRatio == "16:9" {
+		return "landscape/"
+	} else {
+		return "portrait/"
+	}
 }
 
 
